@@ -7,8 +7,16 @@ from robot_control.mecanum_kinematics import (
     normalize_wheel_speeds
 )
 from robot_control.motor_commands import (
-    create_stop_motor_commands,
     wheel_speeds_to_all_motor_commands
+)
+from robot_control.motor_driver import (
+    all_motor_commands_to_gpio_outputs
+)
+from robot_control.l298n_gpio import (
+    apply_motor_commands,
+    cleanup_motor_gpio,
+    initialize_motor_gpio,
+    stop_all_motors
 )
 
 MAX_WHEEL_SPEED = 10.0
@@ -21,19 +29,33 @@ class CmdVelListener(Node):
     def __init__(self):
         super().__init__('cmd_vel_listener')
 
-        self.last_cmd_time = None
-        self.command_timeout = 0.5
-        self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)
-        self.watchdog_triggered = False
+        self.chip = None
 
-        self.subscription = self.create_subscription(
-            Twist,
-            '/cmd_vel',
-            self.cmd_vel_callback,
-            10
-        )
+        try:
 
-        self.get_logger().info('cmd_vel listener started')
+            self.chip = initialize_motor_gpio()
+
+            self.last_cmd_time = None
+            self.command_timeout = 0.5
+            self.watchdog_timer = self.create_timer(0.1, self.watchdog_callback)
+            self.watchdog_triggered = False
+
+            self.subscription = self.create_subscription(
+                Twist,
+                '/cmd_vel',
+                self.cmd_vel_callback,
+                10
+            )
+
+            self.get_logger().info('cmd_vel listener started')
+
+        except Exception:
+            try:
+                if self.chip is not None:
+                    cleanup_motor_gpio(self.chip)
+            finally:
+                self.destroy_node()
+            raise
 
     def watchdog_callback(self):
 
@@ -50,11 +72,10 @@ class CmdVelListener(Node):
 
             self.watchdog_triggered = True
 
-            stop_motor_commands = create_stop_motor_commands()
+            stop_all_motors(self.chip)
 
             self.get_logger().info(
                 'Watchdog triggered, elapsed time since last command exceeded. \n'
-                f'{stop_motor_commands}'
             )
 
     def cmd_vel_callback(self, msg):
@@ -84,6 +105,10 @@ class CmdVelListener(Node):
             MAX_WHEEL_SPEED
         )
 
+        motor_commands_gpio_outputs = all_motor_commands_to_gpio_outputs(motor_commands)
+
+        apply_motor_commands(self.chip, motor_commands_gpio_outputs)
+
         self.get_logger().info(
             f'Forward: {vx:.2f} m/s | '
             f'Sideways: {vy:.2f} m/s | '
@@ -101,16 +126,32 @@ class CmdVelListener(Node):
             f"{motor_commands['RR']['duty_cycle']:.2f}% \n"
         )
 
+    def cleanup(self):
+        cleanup_motor_gpio(self.chip)
+
 
 def main(args=None):
     rclpy.init(args=args)
 
-    node = CmdVelListener()
+    node = None
 
-    rclpy.spin(node)
+    try:
+        node = CmdVelListener()
+        rclpy.spin(node)
 
-    node.destroy_node()
-    rclpy.shutdown()
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        try:
+            if node is not None:
+                try:
+                    node.cleanup()
+                finally:
+                    node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':
